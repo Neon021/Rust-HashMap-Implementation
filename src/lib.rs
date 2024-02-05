@@ -1,3 +1,5 @@
+#![feature(nll)]
+
 use std::borrow::Borrow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -19,31 +21,95 @@ impl<K, V> HashMap<K, V> {
     }
 }
 
+pub struct OccupiedEntry<'a, K: 'a, V: 'a> {
+    entry: &'a mut (K, V),
+}
+
+pub struct VacantEntry<'a, K: 'a, V: 'a> {
+    key: K,
+    bucket: &'a mut Vec<(K, V)>,
+}
+
+impl<'a, K: 'a, V: 'a> VacantEntry<'a, K, V> {
+    pub fn insert(self, value: V) -> &'a mut V {
+        self.bucket.push((self.key, value));
+        &mut self.bucket.last_mut().unwrap().1
+    }
+}
+
+pub enum Entry<'a, K: 'a, V: 'a> {
+    Occupied(OccupiedEntry<'a, K, V>),
+    Vacant(VacantEntry<'a, K, V>),
+}
+
+impl<'a, K, V> Entry<'a, K, V> {
+    pub fn or_insert(self, value: V) -> &'a mut V {
+        match self {
+            Entry::Occupied(e) => &mut e.entry.1,
+            Entry::Vacant(e) => e.insert(value),
+        }
+    }
+
+    pub fn or_insert_with<F>(self, maker: F) -> &'a mut V
+    where
+        F: FnOnce() -> V,
+    {
+        match self {
+            Entry::Occupied(e) => &mut e.entry.1,
+            Entry::Vacant(e) => e.insert(maker()),
+        }
+    }
+
+    pub fn or_default(self) -> &'a mut V
+    where
+        V: Default,
+    {
+        self.or_insert_with(Default::default)
+    }
+}
+
 impl<K, V> HashMap<K, V>
 where
     K: Hash + Eq,
 {
-    fn bucket<Q>(&self, key: &K)
+    fn bucket<Q>(&self, key: &Q) -> usize
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
-        (hasher.finish() % self.buckets.len() as u64) as usize;
+        (hasher.finish() % self.buckets.len() as u64) as usize
+    }
+
+    pub fn entry(&mut self, key: K) -> Entry<K, V> {
+        let bucket = self.bucket(&key);
+
+        for entry in &mut self.buckets[bucket] {
+            if entry.0 == key {
+                return Entry::Occupied(OccupiedEntry {
+                    entry: unsafe { &mut *(entry as *mut _) },
+                });
+            }
+        }
+
+        Entry::Vacant(VacantEntry {
+            key,
+            bucket: &mut self.buckets[bucket],
+        })
     }
 
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         if self.buckets.is_empty() || self.items > 3 * self.buckets.len() / 4 {
             self.resize();
         }
-        let bucket = self.bucket(&key).expect("buckets.is_empty() handled above");
+
+        let bucket = self.bucket(&key);
         let bucket = &mut self.buckets[bucket];
 
         self.items += 1;
         for &mut (ref ekey, ref mut evalue) in bucket.iter_mut() {
             if ekey == &key {
-                use std::mem;
                 return Some(mem::replace(evalue, value));
             }
         }
@@ -57,7 +123,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let bucket = self.bucket(key)?;
+        let bucket = self.bucket(key);
         self.buckets[bucket]
             .iter()
             .find(|&(ref ekey, _)| ekey.borrow() == key)
@@ -79,7 +145,6 @@ where
     {
         let bucket = self.bucket(key);
         let bucket = &mut self.buckets[bucket];
-
         let i = bucket
             .iter()
             .position(|&(ref ekey, _)| ekey.borrow() == key)?;
@@ -87,8 +152,8 @@ where
         Some(bucket.swap_remove(i).1)
     }
 
-    pub fn len(&self) {
-        self.items;
+    pub fn len(&self) -> usize {
+        self.items
     }
 
     pub fn is_empty(&self) -> bool {
@@ -107,7 +172,7 @@ where
         for (key, value) in self.buckets.iter_mut().flat_map(|bucket| bucket.drain(..)) {
             let mut hasher = DefaultHasher::new();
             key.hash(&mut hasher);
-            let bucket = (hasher.finish() % self.buckets.len() as u64) as usize;
+            let bucket = (hasher.finish() % new_buckets.len() as u64) as usize;
             new_buckets[bucket].push((key, value));
         }
 
@@ -169,13 +234,30 @@ mod tests {
         assert!(map.is_empty());
         map.insert("foo", 42);
         assert_eq!(map.len(), 1);
-        assert!(map.is_empty());
+        assert!(!map.is_empty());
         assert_eq!(map.get(&"foo"), Some(&42));
         assert_eq!(map.remove(&"foo"), Some(42));
-        assert_eq!(map.len(), 2);
+        assert_eq!(map.len(), 0);
         assert!(map.is_empty());
         assert_eq!(map.get(&"foo"), None);
     }
+
     #[test]
-    fn iter() {}
+    fn iter() {
+        let mut map = HashMap::new();
+        map.insert("foo", 42);
+        map.insert("bar", 43);
+        map.insert("baz", 142);
+        map.insert("quox", 7);
+        for (&k, &v) in &map {
+            match k {
+                "foo" => assert_eq!(v, 42),
+                "bar" => assert_eq!(v, 43),
+                "baz" => assert_eq!(v, 142),
+                "quox" => assert_eq!(v, 7),
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!((&map).into_iter().count(), 4);
+    }
 }
